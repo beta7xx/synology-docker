@@ -1010,10 +1010,13 @@ execute_download_buildx() {
 #   Installed CLI plugin, or a non-zero exit code if the copy failed.
 #======================================================================================================================
 install_cli_plugin() {
+  # Modes are set explicitly: 'sudo' on DSM runs with umask 077, so freshly created folders and files would otherwise
+  # be root-only (700) and the Docker CLI of a regular user could not see the plugins at all.
   mkdir -p "${DOCKER_CLI_PLUGINS_DIR}"
+  chmod 755 "$(dirname "${DOCKER_CLI_PLUGINS_DIR}")" "${DOCKER_CLI_PLUGINS_DIR}"
   cp "$1" "${DOCKER_CLI_PLUGINS_DIR}/$2" || terminate "Could not install CLI plugin '$2'"
   chown root:root "${DOCKER_CLI_PLUGINS_DIR}/$2"
-  chmod +x "${DOCKER_CLI_PLUGINS_DIR}/$2"
+  chmod 755 "${DOCKER_CLI_PLUGINS_DIR}/$2"
 }
 
 #======================================================================================================================
