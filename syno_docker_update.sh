@@ -49,11 +49,17 @@ readonly SCRIPT_DIR="$(dirname "$(realpath "$0")")"
 readonly DSM_SUPPORTED_VERSION=6
 readonly DEFAULT_DOCKER_VERSION='20.10.11'
 readonly DEFAULT_COMPOSE_VERSION='2.1.1'
+readonly DEFAULT_BUILDX_VERSION='0.37.1'
 readonly CPU_ARCH='x86_64'
 readonly DOWNLOAD_DOCKER="https://download.docker.com/linux/static/stable/${CPU_ARCH}"
 readonly DOWNLOAD_GITHUB='https://github.com/docker/compose'
+readonly DOWNLOAD_GITHUB_BUILDX='https://github.com/docker/buildx'
+# Docker CLI searches this well-known path for 'docker compose' / 'docker buildx' plugins (mirrors the layout of the
+# docker-compose-plugin and docker-buildx-plugin packages on Debian/Ubuntu)
+readonly DOCKER_CLI_PLUGINS_DIR='/usr/local/lib/docker/cli-plugins'
 readonly PINNED_RUNC='https://github.com/opencontainers/runc/releases/download/v1.3.2/runc.amd64'
 readonly GITHUB_API_COMPOSE='https://api.github.com/repos/docker/compose/releases/latest'
+readonly GITHUB_API_BUILDX='https://api.github.com/repos/docker/buildx/releases/latest'
 if [ -d "/var/packages/ContainerManager" ]; then
   readonly SYNO_DOCKER_DIR='/var/packages/ContainerManager'
   readonly SYNO_DOCKER_SERV_NAME='ContainerManager'
@@ -71,6 +77,7 @@ readonly SYNO_DOCKER_SCRIPT="${SYNO_DOCKER_SCRIPT_PATH}/start-stop-status"
 readonly SYNO_DOCKER_JSON_PATH="${SYNO_DOCKER_DIR}/etc"
 readonly SYNO_DOCKER_JSON="${SYNO_DOCKER_JSON_PATH}/dockerd.json"
 readonly SYNO_DOCKER_SCRIPT_FORWARDING="            # Added by docker update\n          iptables -P FORWARD ACCEPT\n          iptables -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -I FORWARD 1 -j DOCKER-FORWARD"
+readonly DEFAULT_MASQ_SUBNET='172.16.0.0/12'
 readonly SYNO_SERVICE_STOP_TIMEOUT='10m'
 readonly SYNOPKG_BIN='/usr/syno/bin/synopkg'
 readonly SYNOSERVICECTL_BIN='/usr/syno/sbin/synoservicectl'
@@ -94,12 +101,15 @@ fi
 dsm_major_version=''
 docker_version=''
 compose_version=''
+compose_plugin_version=''
+buildx_version=''
 temp_dir="/tmp/docker_update"
 backup_dir="${PWD}"
 download_dir="${temp_dir}"
 docker_backup_filename="docker_backup_$(date +%Y%m%d_%H%M%S).tgz"
 skip_docker_update='false'
 skip_compose_update='false'
+skip_buildx_update='false'
 skip_driver_update='false'
 force='false'
 stage='false'
@@ -107,12 +117,14 @@ command=''
 target='all'
 target_docker_version=''
 target_compose_version=''
+target_buildx_version=''
 backup_filename_flag='false'
 step=0
 total_steps=0
 install_iptables_modules='false'
 skip_iptables_modules='false'
 install_apparmor='false'
+masq_subnet="${DEFAULT_MASQ_SUBNET}"
 
 
 #======================================================================================================================
@@ -137,18 +149,20 @@ usage() {
   echo "  -f, --force            Force update (bypass compatibility check and confirmation check)"
   echo "  -p, --path PATH        Path of the backup (defaults to '${backup_dir}')"
   echo "  -s, --stage            Stage only, do not actually replace binaries or configuration of log driver"
-  echo "  -t, --target           Target to update, either 'all' (default), 'engine', 'compose', or 'driver'"
+  echo "  -t, --target           Target to update, either 'all' (default), 'engine', 'compose', 'buildx', or 'driver'"
+  echo "  -x, --buildx VERSION   Docker Buildx plugin target version (defaults to latest)"
   echo "  --skip-iptables        Do not check for / install iptables modules"
+  echo "  --masq-subnet CIDR     Source subnet for the fallback NAT MASQUERADE rule (defaults to '${DEFAULT_MASQ_SUBNET}')"
 
   echo
   echo "Commands:"
-  echo "  backup                 Create a backup of Docker and Docker Compose binaries and dockerd configuration"
-  echo "  download [PATH]        Download Docker and Docker Compose binaries to PATH"
-  echo "  install [PATH]         Update Docker and Docker Compose from files on PATH"
-  echo "  restore                Restore Docker and Docker Compose from backup"
-  echo "  update                 Update Docker and Docker Compose to target version (creates backup first)"
+  echo "  backup                 Create a backup of Docker, Compose and Buildx binaries and dockerd configuration"
+  echo "  download [PATH]        Download Docker, Compose and Buildx binaries to PATH"
+  echo "  install [PATH]         Update Docker, Compose and Buildx from files on PATH"
+  echo "  restore                Restore Docker, Compose and Buildx from backup"
+  echo "  update                 Update Docker, Compose and Buildx to target version (creates backup first)"
   echo "  logger                 Update ONLY the logging driver to the local logger (a proactive preparation step)"
-  echo "  only_script            Update ONLY the start-stop-status IP forwarding block (no binaries, no restart)"
+  echo "  only_script            Update ONLY the start-stop-status IP forwarding / NAT block (no binaries, no restart)"
   echo "  validate               Validates versions available for update"
   echo
 }
@@ -195,12 +209,18 @@ detect_current_versions() {
     compose_version=$(docker-compose -v 2>/dev/null | grep -Eo "[0-9]*.[0-9]*.[0-9]*," | cut -d',' -f 1)
   fi
 
+  # Detect current Docker Compose CLI plugin version ('docker compose') and Buildx plugin version ('docker buildx')
+  compose_plugin_version=$(docker compose version 2>/dev/null | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+" | head -1 | cut -c 2-)
+  buildx_version=$(docker buildx version 2>/dev/null | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+" | head -1 | cut -c 2-)
+
   containerd_version=$(containerd -version | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
   runc_version=$(runc -version | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
 
   echo "Current DSM version: ${dsm_version:-Unknown}"
   echo "Current Docker version: ${docker_version:-Unknown}"
   echo "Current Docker Compose version: ${compose_version:-Unknown}"
+  echo "Current Docker Compose plugin version: ${compose_plugin_version:-Not installed}"
+  echo "Current Docker Buildx plugin version: ${buildx_version:-Not installed}"
   echo "Current containerd version: ${containerd_version:-Unknown}"
   echo "Current runc version: ${runc_version:-Unknown}"
 
@@ -297,6 +317,16 @@ detect_available_versions() {
       target_compose_version="${DEFAULT_COMPOSE_VERSION}"
     fi
   fi
+
+  # Detect latest available stable Docker Buildx version
+  if [ -z "${target_buildx_version}" ] && [ "${skip_buildx_update}" = 'false' ] ; then
+    target_buildx_version=$(curl -s "${GITHUB_API_BUILDX}" | jq -r '.tag_name | ltrimstr("v")')
+
+    if [ -z "${target_buildx_version}" ] || [ "${target_buildx_version}" = "null" ] ; then
+      echo "Could not detect Docker Buildx versions available for download, setting default value"
+      target_buildx_version="${DEFAULT_BUILDX_VERSION}"
+    fi
+  fi
 }
 
 #======================================================================================================================
@@ -319,6 +349,11 @@ validate_available_versions() {
   # Test Docker Compose is available for download, exit otherwise
   if [ -z "${target_compose_version}" ] && [ "${skip_compose_update}" = 'false' ] ; then
     terminate "Could not find Docker Compose binaries for downloading"
+  fi
+
+  # Test Docker Buildx is available for download, exit otherwise
+  if [ -z "${target_buildx_version}" ] && [ "${skip_buildx_update}" = 'false' ] ; then
+    terminate "Could not find Docker Buildx binaries for downloading"
   fi
 }
 
@@ -346,6 +381,27 @@ validate_downloaded_versions() {
   # Test Docker-compose binary is available on path
   if [ ! -f "${download_dir}/docker-compose" ] && [ "${skip_compose_update}" = 'false' ] ; then
     terminate "Could not find Docker compose binary (${download_dir}/docker-compose)"
+  fi
+
+  # Test Docker Buildx binary is available on path
+  if [ ! -f "${download_dir}/docker-buildx" ] && [ "${skip_buildx_update}" = 'false' ] ; then
+    terminate "Could not find Docker Buildx binary (${download_dir}/docker-buildx)"
+  fi
+}
+
+#======================================================================================================================
+# Validates if a provided subnet string is a plausible IPv4 CIDR (e.g. '172.16.0.0/12').
+#======================================================================================================================
+# Arguments:
+#   $1 - Subnet string to be verified.
+#   $2 - Error message.
+# Outputs:
+#   Terminates with non-zero exit code if the subnet string does not conform to the expected pattern.
+#======================================================================================================================
+validate_subnet_input() {
+  if ! echo "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$' ; then
+    usage
+    terminate "$2"
   fi
 }
 
@@ -486,21 +542,31 @@ validate_target() {
     all )
       skip_docker_update='false'
       skip_compose_update='false'
+      skip_buildx_update='false'
       skip_driver_update='false'
       ;;
     engine )
       skip_docker_update='false'
       skip_compose_update='true'
+      skip_buildx_update='true'
       skip_driver_update='false'
       ;;
     compose )
       skip_docker_update='true'
       skip_compose_update='false'
+      skip_buildx_update='true'
+      skip_driver_update='true'
+      ;;
+    buildx )
+      skip_docker_update='true'
+      skip_compose_update='true'
+      skip_buildx_update='false'
       skip_driver_update='true'
       ;;
     driver )
       skip_docker_update='true'
       skip_compose_update='true'
+      skip_buildx_update='true'
       skip_driver_update='false'
       ;;
     * )
@@ -529,8 +595,10 @@ validate_target() {
 define_update() {
   if [ "${force}" != 'true' ] ; then
     if [ "${docker_version}" = "${target_docker_version}" ] && \
-      [ "${compose_version}" = "${target_compose_version}" ] ; then
-      terminate_with_warning "Already on target version for Docker and Docker Compose"
+      [ "${compose_version}" = "${target_compose_version}" ] && \
+      [ "${compose_plugin_version}" = "${target_compose_version}" ] && \
+      [ "${buildx_version}" = "${target_buildx_version}" ] ; then
+      terminate_with_warning "Already on target version for Docker, Docker Compose and Docker Buildx"
     fi
     major="${target_docker_version%%.*}"
     if [[ "$major" -ge 28 && "${skip_iptables_modules}" = 'false' ]]; then
@@ -545,8 +613,15 @@ define_update() {
       skip_docker_update='true'
       total_steps=$((total_steps-1))
     fi
-    if [ "${compose_version}" = "${target_compose_version}" ] && [ "${skip_compose_update}" = 'false' ]; then
+    # Compose is only up to date when both the standalone 'docker-compose' and the 'docker compose' plugin match
+    if [ "${compose_version}" = "${target_compose_version}" ] && \
+      [ "${compose_plugin_version}" = "${target_compose_version}" ] && \
+      [ "${skip_compose_update}" = 'false' ]; then
       skip_compose_update='true'
+      total_steps=$((total_steps-1))
+    fi
+    if [ "${buildx_version}" = "${target_buildx_version}" ] && [ "${skip_buildx_update}" = 'false' ]; then
+      skip_buildx_update='true'
       total_steps=$((total_steps-1))
     fi
 
@@ -586,6 +661,7 @@ define_target_version() {
   detect_available_versions
   [ "${skip_docker_update}" = 'false' ] && echo "Target Docker version: ${target_docker_version:-Unknown}"
   [ "${skip_compose_update}" = 'false' ] && echo "Target Docker Compose version: ${target_compose_version:-Unknown}"
+  [ "${skip_buildx_update}" = 'false' ] && echo "Target Docker Buildx version: ${target_buildx_version:-Unknown}"
   validate_available_versions
 }
 
@@ -602,6 +678,7 @@ define_target_download() {
   detect_available_downloads
   [ "${skip_docker_update}" = 'false' ] && echo "Target Docker version: ${target_docker_version:-Unknown}"
   [ "${skip_compose_update}" = 'false' ] && echo "Target Docker Compose version: Unknown"
+  [ "${skip_buildx_update}" = 'false' ] && echo "Target Docker Buildx version: Unknown"
   validate_downloaded_versions
 }
 
@@ -621,7 +698,8 @@ confirm_operation() {
     echo
     echo "WARNING! This will replace:"
     [ "${skip_docker_update}" = "false" ]  && echo "  - Docker Engine"
-    [ "${skip_compose_update}" = "false" ] && echo "  - Docker Compose"
+    [ "${skip_compose_update}" = "false" ] && echo "  - Docker Compose (standalone 'docker-compose' and 'docker compose' plugin)"
+    [ "${skip_buildx_update}" = "false" ]  && echo "  - Docker Buildx plugin"
     [ "${skip_driver_update}" = "false" ]  && echo "  - Docker daemon log driver"
     echo
 
@@ -763,8 +841,14 @@ execute_stop_syno() {
 execute_backup() {
   print_status "Backing up current Docker binaries (${backup_dir}/${docker_backup_filename})"
   cd "${backup_dir}" || terminate "Backup directory does not exist"
-  tar -czvf "${docker_backup_filename}" -C "$SYNO_DOCKER_BIN_PATH" bin -C "$SYNO_DOCKER_JSON_PATH" "dockerd.json" \
-    -C "${SYNO_DOCKER_SCRIPT_PATH}" "start-stop-status"
+  # the CLI plugins folder ('docker compose' / 'docker buildx') is optional as it does not exist on a stock install
+  if [ -d "${DOCKER_CLI_PLUGINS_DIR}" ] ; then
+    tar -czvf "${docker_backup_filename}" -C "$SYNO_DOCKER_BIN_PATH" bin -C "$SYNO_DOCKER_JSON_PATH" "dockerd.json" \
+      -C "${SYNO_DOCKER_SCRIPT_PATH}" "start-stop-status" -C "$(dirname "${DOCKER_CLI_PLUGINS_DIR}")" "cli-plugins"
+  else
+    tar -czvf "${docker_backup_filename}" -C "$SYNO_DOCKER_BIN_PATH" bin -C "$SYNO_DOCKER_JSON_PATH" "dockerd.json" \
+      -C "${SYNO_DOCKER_SCRIPT_PATH}" "start-stop-status"
+  fi
   if [ ! -f "${docker_backup_filename}" ] ; then
     terminate "Backup issue"
   fi
@@ -895,8 +979,47 @@ execute_download_compose() {
 }
 
 #======================================================================================================================
-# Install the Docker and Docker Compose binaries, unless instructed to skip installation or when 'stage' is set to
-# true.
+# Downloads the targeted Docker Buildx plugin binary, unless instructed to skip the download.
+#======================================================================================================================
+# Globals:
+#   - download_dir
+#   - skip_buildx_update
+#   - target_buildx_version
+# Outputs:
+#   A downloaded Docker Buildx binary, or a non-zero exit code if the download has failed.
+#======================================================================================================================
+execute_download_buildx() {
+  if [ "${skip_buildx_update}" = 'false' ] ; then
+    buildx_bin="${DOWNLOAD_GITHUB_BUILDX}/releases/download/v${target_buildx_version}/buildx-v${target_buildx_version}.linux-amd64"
+
+    print_status "Downloading target Docker Buildx binary (${buildx_bin})"
+    response=$(curl -L "${buildx_bin}" --write-out '%{http_code}' -o "${download_dir}/docker-buildx")
+    if [ "${response}" != 200 ] ; then
+      terminate "Binary could not be downloaded"
+    fi
+  fi
+}
+
+#======================================================================================================================
+# Installs a Docker CLI plugin binary into the well-known CLI plugins folder.
+#======================================================================================================================
+# Arguments:
+#   $1 - Source binary path.
+#   $2 - Plugin name (e.g. 'docker-compose' or 'docker-buildx').
+# Outputs:
+#   Installed CLI plugin, or a non-zero exit code if the copy failed.
+#======================================================================================================================
+install_cli_plugin() {
+  mkdir -p "${DOCKER_CLI_PLUGINS_DIR}"
+  cp "$1" "${DOCKER_CLI_PLUGINS_DIR}/$2" || terminate "Could not install CLI plugin '$2'"
+  chown root:root "${DOCKER_CLI_PLUGINS_DIR}/$2"
+  chmod +x "${DOCKER_CLI_PLUGINS_DIR}/$2"
+}
+
+#======================================================================================================================
+# Install the Docker, Docker Compose and Docker Buildx binaries, unless instructed to skip installation or when
+# 'stage' is set to true. Compose is installed both as standalone 'docker-compose' (backwards compatibility) and as
+# CLI plugin ('docker compose'); Buildx is installed as CLI plugin ('docker buildx').
 #======================================================================================================================
 # Globals:
 #   - download_dir
@@ -915,6 +1038,10 @@ execute_install_bin() {
     fi
     if [ "${skip_compose_update}" = 'false' ] ; then
       cp "${download_dir}"/docker-compose "${SYNO_DOCKER_BIN}"/docker-compose
+      install_cli_plugin "${download_dir}"/docker-compose docker-compose
+    fi
+    if [ "${skip_buildx_update}" = 'false' ] ; then
+      install_cli_plugin "${download_dir}"/docker-buildx docker-buildx
     fi
     chown root:root "${SYNO_DOCKER_BIN}"/*
     chmod +x "${SYNO_DOCKER_BIN}"/*
@@ -949,6 +1076,13 @@ execute_restore_bin() {
     # copy Docker Compose
     if [ "${skip_compose_update}" = 'false' ] ; then
       cp "${temp_dir}"/docker/docker-compose "${SYNO_DOCKER_BIN}"/
+      if [ -f "${temp_dir}"/cli-plugins/docker-compose ] ; then
+        install_cli_plugin "${temp_dir}"/cli-plugins/docker-compose docker-compose
+      fi
+    fi
+    # copy Docker Buildx plugin (only present in backups made after the plugin was installed)
+    if [ "${skip_buildx_update}" = 'false' ] && [ -f "${temp_dir}"/cli-plugins/docker-buildx ] ; then
+      install_cli_plugin "${temp_dir}"/cli-plugins/docker-buildx docker-buildx
     fi
     chown root:root "${SYNO_DOCKER_BIN}"/*
     chmod +x "${SYNO_DOCKER_BIN}"/*
@@ -992,10 +1126,16 @@ execute_update_log() {
 #   Updated start-stop-status script.
 #======================================================================================================================
 execute_update_script() {
-  print_status "Enabling IP forwarding"
+  print_status "Enabling IP forwarding and NAT masquerading"
   if [ "${stage}" = 'false' ]; then
     # File to edit
     file="${SYNO_DOCKER_SCRIPT}"
+
+    # Fallback MASQUERADE rule in the DSM-managed DEFAULT_POSTROUTING chain. dockerd adds its own MASQUERADE rules to
+    # nat POSTROUTING, but DSM's firewall reloads flush them, leaving containers without outbound NAT. The rule is only
+    # added when the chain exists (it is absent when the DSM firewall is disabled) and only once (checked with -C).
+    masq_rule="-s ${masq_subnet} ! -d ${masq_subnet} -j MASQUERADE"
+    masq_line="          iptables -t nat -L DEFAULT_POSTROUTING -n >/dev/null 2>\&1 \&\& { iptables -t nat -C DEFAULT_POSTROUTING ${masq_rule} 2>/dev/null || iptables -t nat -A DEFAULT_POSTROUTING ${masq_rule}; }"
 
     # Verify the insertion anchor exists before touching the file, so a missing anchor leaves
     # the file unmodified.
@@ -1009,10 +1149,11 @@ execute_update_script() {
       sed -i '/^[[:space:]]*iptables -[ID] FORWARD -[io] docker0 -j ACCEPT[[:space:]]*$/d' "${file}"
       sed -i '/^[[:space:]]*# Added by docker update[[:space:]]*$/{N;/\n[[:space:]]*iptables -P FORWARD ACCEPT/d}' "${file}"
       sed -i '/^[[:space:]]*iptables -P FORWARD ACCEPT[[:space:]]*$/d' "${file}"
+      sed -i '/^[[:space:]]*iptables -t nat -.*DEFAULT_POSTROUTING .*-j MASQUERADE/d' "${file}"
 
       # Insert only after the daemon is confirmed up.
-      sed -i "/${match}/i\\${SYNO_DOCKER_SCRIPT_FORWARDING}" "${file}"
-      echo "Added IP forwarding configuration to ${file} (post daemon start)."
+      sed -i "/${match}/i\\${SYNO_DOCKER_SCRIPT_FORWARDING}\\n${masq_line}" "${file}"
+      echo "Added IP forwarding and NAT masquerading (${masq_subnet}) configuration to ${file} (post daemon start)."
     else
       echo "WARNING: anchor '\$DockerUpdaterBin postdaemonup' not found in ${file}."
       echo "         File left unmodified -- check the file manually."
@@ -1169,7 +1310,7 @@ execute_clean() {
 #======================================================================================================================
 main() {
   # Show header
-  echo "Update Docker Engine and Docker Compose on Synology to target version"
+  echo "Update Docker Engine, Docker Compose and Docker Buildx on Synology to target version"
   echo
 
   # Test if script has root privileges, exit otherwise
@@ -1204,8 +1345,18 @@ main() {
       -f | --force )
         force='true'
         ;;
+      -x | --buildx )
+        shift
+        target_buildx_version="$1"
+        validate_version_input "${target_buildx_version}" "Unrecognized target Docker Buildx version"
+        ;;
       --skip-iptables )
         skip_iptables_modules='true'
+        ;;
+      --masq-subnet )
+        shift
+        masq_subnet="$1"
+        validate_subnet_input "${masq_subnet}" "Unrecognized subnet for --masq-subnet (expected IPv4 CIDR, e.g. 172.16.0.0/12)"
         ;;
       -h | --help )
         usage
@@ -1254,12 +1405,13 @@ main() {
       execute_backup
       ;;
     download )
-      total_steps=2
+      total_steps=3
       detect_current_versions
       execute_prepare
       define_target_version
       execute_download_bin
       execute_download_compose
+      execute_download_buildx
       ;;
     install )
       total_steps=8
@@ -1302,7 +1454,7 @@ main() {
       execute_start_syno
       ;;
     update )
-      total_steps=12
+      total_steps=13
       detect_current_versions
       validate_syno_tools
       execute_prepare
@@ -1313,6 +1465,7 @@ main() {
       install_modules
       execute_download_bin
       execute_download_compose
+      execute_download_buildx
       execute_stop_syno
       execute_extract_bin
       execute_install_bin

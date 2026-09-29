@@ -53,13 +53,48 @@ Portainer currently **persists the original logging driver** used when a contain
 
 At a high level:
 
-1. Downloads official Docker & Compose binaries
+1. Downloads official Docker, Compose & Buildx binaries
 2. Backs up your existing Docker install
 3. Stops Docker safely
 4. Replaces binaries & config
 5. Restarts Docker
 
 Everything is scripted. Nothing is magic. Rollbacks are built‑in.
+
+### What you end up with (vs. Docker's Ubuntu packages)
+
+DSM has no `apt`/`dpkg`, so the `.deb` packages Docker recommends for Ubuntu can't be installed directly. Instead the
+script installs the **same official static binaries** those packages contain, so the result is equivalent to:
+
+| Ubuntu package          | What gets installed on the NAS                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------- |
+| `docker-ce`             | `dockerd`, `docker-init`, `docker-proxy` from the official static tarball                   |
+| `docker-ce-cli`         | `docker` from the same tarball                                                              |
+| `containerd.io`         | `containerd`, `containerd-shim-runc-v2`, `ctr`, `runc` from the same tarball                |
+| `docker-compose-plugin` | `docker compose` CLI plugin (also kept as standalone `docker-compose` for backwards compat) |
+| `docker-buildx-plugin`  | `docker buildx` CLI plugin                                                                  |
+
+Engine binaries go to the ContainerManager/Docker package `bin` folder. CLI plugins go to
+`/usr/local/lib/docker/cli-plugins`, the well-known path the Docker CLI searches, so `docker compose` and
+`docker buildx` work for all users. Plugins are included in backups and restored by `restore`.
+
+### Networking fixes applied to `start-stop-status`
+
+Every `update` (and `only_script`) inserts a small block into the package's `start-stop-status` that runs after
+dockerd is up:
+
+- **FORWARD chain**: sets the policy to `ACCEPT` and jumps to `DOCKER-FORWARD`, so published ports stay reachable
+  after a clean boot.
+- **NAT MASQUERADE fallback**: DSM firewall reloads flush the MASQUERADE rules dockerd adds to `nat POSTROUTING`,
+  leaving containers without outbound internet. The script adds a persistent catch-all rule to the DSM-managed
+  `DEFAULT_POSTROUTING` chain (skipped when that chain does not exist, e.g. DSM firewall disabled):
+
+  ```bash
+  iptables -t nat -A DEFAULT_POSTROUTING -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j MASQUERADE
+  ```
+
+  `172.16.0.0/12` covers Docker's default address pool. If your networks use custom subnets outside that range,
+  pass `--masq-subnet CIDR` (e.g. `--masq-subnet 192.168.100.0/22`). `fix_ipforward.sh` accepts the same option.
 
 ## Installation
 
@@ -156,6 +191,9 @@ sudo ./syno_docker_update.sh [OPTIONS] COMMAND
 | ------------------- | ------------------------- |
 | `--docker VERSION`  | Target Docker version     |
 | `--compose VERSION` | Target Compose version    |
+| `--buildx VERSION`  | Target Buildx version     |
+| `--masq-subnet CIDR` | Source subnet for the fallback NAT MASQUERADE rule (default `172.16.0.0/12`) |
+| `--target NAME`     | `all`, `engine`, `compose`, `buildx`, or `driver` |
 | `--backup NAME`     | Backup file name          |
 | `--force`           | Skip compatibility checks |
 | `--stage`           | Download only, no install |
