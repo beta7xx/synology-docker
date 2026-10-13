@@ -57,7 +57,8 @@ readonly DOWNLOAD_GITHUB_BUILDX='https://github.com/docker/buildx'
 # Docker CLI searches this well-known path for 'docker compose' / 'docker buildx' plugins (mirrors the layout of the
 # docker-compose-plugin and docker-buildx-plugin packages on Debian/Ubuntu)
 readonly DOCKER_CLI_PLUGINS_DIR='/usr/local/lib/docker/cli-plugins'
-readonly PINNED_RUNC='https://github.com/opencontainers/runc/releases/download/v1.3.2/runc.amd64'
+readonly PINNED_RUNC_VERSION='1.4.3'
+readonly PINNED_RUNC="https://github.com/opencontainers/runc/releases/download/v${PINNED_RUNC_VERSION}/runc.amd64"
 readonly GITHUB_API_COMPOSE='https://api.github.com/repos/docker/compose/releases/latest'
 readonly GITHUB_API_BUILDX='https://api.github.com/repos/docker/buildx/releases/latest'
 if [ -d "/var/packages/ContainerManager" ]; then
@@ -79,7 +80,9 @@ readonly SYNO_DOCKER_JSON="${SYNO_DOCKER_JSON_PATH}/dockerd.json"
 readonly SYNO_DOCKER_SCRIPT_FORWARDING="            # Added by docker update\n          iptables -P FORWARD ACCEPT\n          iptables -C FORWARD -j DOCKER-FORWARD 2>/dev/null || iptables -I FORWARD 1 -j DOCKER-FORWARD"
 readonly DEFAULT_MASQ_SUBNET='172.16.0.0/12'
 readonly SYNO_SERVICE_STOP_TIMEOUT='10m'
+readonly SYNO_STATUS_POLL_INTERVAL=5
 readonly SYNOPKG_BIN='/usr/syno/bin/synopkg'
+readonly FUSE_OVERLAYFS_RC_SCRIPT='/usr/local/etc/rc.d/containerd-fuse-overlayfs.sh'
 readonly SYNOSERVICECTL_BIN='/usr/syno/sbin/synoservicectl'
 if ! RUNNING_CONTAINERS=$(docker ps -q 2>/dev/null | awk 'NF' | wc -l); then
   RUNNING_CONTAINERS=0
@@ -124,6 +127,8 @@ total_steps=0
 install_iptables_modules='false'
 skip_iptables_modules='false'
 install_apparmor='false'
+refresh_runc='false'
+install_fuse='false'
 masq_subnet="${DEFAULT_MASQ_SUBNET}"
 
 
@@ -153,16 +158,20 @@ usage() {
   echo "  -x, --buildx VERSION   Docker Buildx plugin target version (defaults to latest)"
   echo "  --skip-iptables        Do not check for / install iptables modules"
   echo "  --masq-subnet CIDR     Source subnet for the fallback NAT MASQUERADE rule (defaults to '${DEFAULT_MASQ_SUBNET}')"
+  echo "  --fuse-overlayfs       Switch Docker to fuse-overlayfs storage (only for 'aufs' setups without overlay support)"
 
   echo
   echo "Commands:"
-  echo "  backup                 Create a backup of Docker, Compose and Buildx binaries and dockerd configuration"
-  echo "  download [PATH]        Download Docker, Compose and Buildx binaries to PATH"
-  echo "  install [PATH]         Update Docker, Compose and Buildx from files on PATH"
-  echo "  restore                Restore Docker, Compose and Buildx from backup"
-  echo "  update                 Update Docker, Compose and Buildx to target version (creates backup first)"
+  echo "  backup                 Create a backup of Docker, Docker Compose and Buildx binaries and dockerd configuration"
+  echo "  download [PATH]        Download Docker, Docker Compose and Buildx binaries to PATH"
+  echo "  install [PATH]         Update Docker, Docker Compose and Buildx from files on PATH"
+  echo "  restore                Restore Docker, Docker Compose and Buildx from backup (works with the package stopped)"
+  echo "  start                  Start the Docker package and report why if it doesn't come up"
+  echo "  stop                   Stop the Docker package, waiting for it to finish (or report why it didn't)"
+  echo "  update                 Update Docker, Docker Compose and Buildx to target version (creates backup first)"
   echo "  logger                 Update ONLY the logging driver to the local logger (a proactive preparation step)"
-  echo "  only_script            Update ONLY the start-stop-status IP forwarding / NAT block (no binaries, no restart)"
+  echo "  only_script            Update ONLY the start-stop-status IP forwarding block and how the iptables modules"
+  echo "                         are loaded (no binaries, no restart). Run it after a Container Manager package update"
   echo "  validate               Validates versions available for update"
   echo
 }
@@ -178,6 +187,20 @@ usage() {
 print_status() {
   step=$((step + 1))
   printf "${BOLD}%s${NC}\n" "Step ${step} from ${total_steps}: $1"
+}
+
+#======================================================================================================================
+# Compares two 'major.minor.revision' version strings.
+#======================================================================================================================
+# Arguments:
+#   $1 - Version to test
+#   $2 - Version to compare against
+# Outputs:
+#   Returns 0 if $1 is lower than $2, non-zero otherwise (including when either version is empty).
+#======================================================================================================================
+version_lt() {
+  [ -n "$1" ] && [ -n "$2" ] && [ "$1" != "$2" ] && \
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -bt. -k1,1n -k2,2n -k3,3n | head -1)" = "$1" ]
 }
 
 #======================================================================================================================
@@ -213,8 +236,8 @@ detect_current_versions() {
   compose_plugin_version=$(docker compose version 2>/dev/null | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+" | head -1 | cut -c 2-)
   buildx_version=$(docker buildx version 2>/dev/null | grep -Eo "v[0-9]+\.[0-9]+\.[0-9]+" | head -1 | cut -c 2-)
 
-  containerd_version=$(containerd -version | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
-  runc_version=$(runc -version | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
+  containerd_version=$(containerd -version 2>/dev/null | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
+  runc_version=$(runc -version 2>/dev/null | grep -Eo "v[0-9]+.[0-9]+.[0-9]+" | cut -c 2-)
 
   echo "Current DSM version: ${dsm_version:-Unknown}"
   echo "Current Docker version: ${docker_version:-Unknown}"
@@ -251,6 +274,22 @@ validate_current_version() {
   # Test if host is DSM 6 or later, exit otherwise
   if [ "${dsm_major_version}" -lt "${DSM_SUPPORTED_VERSION}" ] ; then
     terminate "This script supports DSM 6.x or later only, use --force to override"
+  fi
+
+  # Restoring and controlling the service don't depend on the current versions, and are needed most when Docker is
+  # stopped or broken
+  case "${command}" in
+    restore | start | stop ) return ;;
+  esac
+
+  # DSM removes the Docker binaries from PATH while the package is stopped, so versions can't be detected. Starting
+  # it is the fix (this script stops it again itself); --force would skip the checks instead.
+  if { [ -z "${docker_version}" ] && [ "${skip_docker_update}" = 'false' ] ; } || \
+    { [ -z "${compose_version}" ] && [ "${skip_compose_update}" = 'false' ] ; } ; then
+    syno_status=$(get_syno_status)
+    if [ "${syno_status}" != 'started' ] ; then
+      terminate "${SYNO_DOCKER_SERV_NAME} is not running (status: ${syno_status}), so the current Docker version can't be detected. Start it first with '$(syno_start_cmd)', then re-run this script"
+    fi
   fi
 
   # Test Docker version is present, exit otherwise
@@ -593,25 +632,31 @@ validate_target() {
 #   Terminates with non-zero exit code if both Docker and Docker Compose are already up to date, unless forced.
 #======================================================================================================================
 define_update() {
+  define_setup_steps
+
+  # Steps already ruled out by --target (the checks below only adjust for flags they set themselves)
+  [ "${skip_docker_update}" = 'true' ] && total_steps=$((total_steps-2))  # no Docker download or extract step
+  [ "${skip_compose_update}" = 'true' ] && total_steps=$((total_steps-1))  # no Compose download step
+
   if [ "${force}" != 'true' ] ; then
+    # Docker 29.7.0+ bundles runc 1.4.3+, which works on DSM 5.x kernels. An older runc on such a target means a
+    # previously pinned (or outdated) runc is still installed, so reinstall the Docker binaries to replace it.
+    if [ "${docker_version}" = "${target_docker_version}" ] && \
+      version_lt "${runc_version}" '1.4.1' && ! version_lt "${target_docker_version}" '29.7.0' ; then
+      refresh_runc='true'
+      echo "runc ${runc_version} is older than the version bundled with Docker ${target_docker_version}," \
+        "reinstalling Docker binaries to refresh runc"
+    fi
     if [ "${docker_version}" = "${target_docker_version}" ] && \
       [ "${compose_version}" = "${target_compose_version}" ] && \
       [ "${compose_plugin_version}" = "${target_compose_version}" ] && \
-      [ "${buildx_version}" = "${target_buildx_version}" ] ; then
+      [ "${buildx_version}" = "${target_buildx_version}" ] && [ "${refresh_runc}" = 'false' ] ; then
       terminate_with_warning "Already on target version for Docker, Docker Compose and Docker Buildx"
     fi
-    major="${target_docker_version%%.*}"
-    if [[ "$major" -ge 28 && "${skip_iptables_modules}" = 'false' ]]; then
-      install_iptables_modules='true'
-      total_steps=$((total_steps+1))
-    fi
-    if [[ "$major" -ge 29 ]]; then
-      install_apparmor='true'
-      total_steps=$((total_steps+1))
-    fi
-    if [ "${docker_version}" = "${target_docker_version}" ] && [ "${skip_docker_update}" = 'false' ] ; then
+    if [ "${docker_version}" = "${target_docker_version}" ] && [ "${skip_docker_update}" = 'false' ] && \
+      [ "${refresh_runc}" = 'false' ] ; then
       skip_docker_update='true'
-      total_steps=$((total_steps-1))
+      total_steps=$((total_steps-2))  # no Docker download or extract step
     fi
     # Compose is only up to date when both the standalone 'docker-compose' and the 'docker compose' plugin match
     if [ "${compose_version}" = "${target_compose_version}" ] && \
@@ -627,9 +672,35 @@ define_update() {
 
     log_driver=$(jq -r '.["log-driver"] // empty' "${SYNO_DOCKER_JSON}")
     if [ "$log_driver" = "local" ]; then
-      skip_driver_update='true'
-      total_steps=$((total_steps-1))
+      skip_driver_update='true'  # the log driver step still runs (and reports it's skipping)
     fi
+  fi
+
+  define_storage_driver
+}
+
+#======================================================================================================================
+# Enables the setup steps the target Docker version depends on: iptables raw modules for v28+ (unless skipped) and the
+# AppArmor profile for v29+. These run whether or not the operation is forced; --force only bypasses the checks.
+#======================================================================================================================
+# Globals:
+#   - install_apparmor
+#   - install_iptables_modules
+#   - skip_iptables_modules
+#   - target_docker_version
+#   - total_steps
+# Outputs:
+#   Updated 'install_iptables_modules', 'install_apparmor' and 'total_steps'.
+#======================================================================================================================
+define_setup_steps() {
+  major="${target_docker_version%%.*}"
+  if [[ "$major" -ge 28 && "${skip_iptables_modules}" = 'false' ]]; then
+    install_iptables_modules='true'
+    total_steps=$((total_steps+1))
+  fi
+  if [[ "$major" -ge 29 ]]; then
+    install_apparmor='true'
+    total_steps=$((total_steps+1))
   fi
 }
 
@@ -680,6 +751,47 @@ define_target_download() {
   [ "${skip_compose_update}" = 'false' ] && echo "Target Docker Compose version: Unknown"
   [ "${skip_buildx_update}" = 'false' ] && echo "Target Docker Buildx version: Unknown"
   validate_downloaded_versions
+  define_storage_driver
+}
+
+#======================================================================================================================
+# Checks the storage driver will work with the target Docker version. Docker 24+ dropped 'aufs' (Synology's own
+# Docker build keeps it), so on 'aufs' setups without overlay support the upgrade would leave Docker unable to start;
+# fuse-overlayfs is the way forward there, and is only ever set up when asked for with --fuse-overlayfs.
+#======================================================================================================================
+# Globals:
+#   - force
+#   - install_fuse
+#   - skip_docker_update
+#   - target_docker_version
+#   - total_steps
+# Outputs:
+#   Updated 'total_steps', a warning, or termination if the target version can't use the current storage driver.
+#======================================================================================================================
+define_storage_driver() {
+  if [ "${install_fuse}" = 'true' ] ; then
+    total_steps=$((total_steps+1))
+    return
+  fi
+
+  # Only relevant when the Docker engine itself is being replaced with a version that has dropped aufs
+  target_major="${target_docker_version%%.*}"
+  if [ "${skip_docker_update}" = 'true' ] || ! [ "${target_major}" -ge 24 ] 2>/dev/null ; then
+    return
+  fi
+  storage_driver=$(jq -r '.["storage-driver"] // empty' "${SYNO_DOCKER_JSON}" 2>/dev/null)
+  if [ "${storage_driver}" != 'aufs' ] ; then
+    return
+  fi
+  if grep -qw overlay /proc/filesystems 2>/dev/null || modprobe -n overlay 2>/dev/null ; then
+    advice="This kernel supports overlay: set \"storage-driver\" to \"overlay2\" in ${SYNO_DOCKER_JSON} (images will need pulling again), or stay on a version below 24."
+  else
+    advice="This kernel has no overlay support: re-run with --fuse-overlayfs to switch to fuse-overlayfs (see the README), or stay on a version below 24."
+  fi
+  if [ "${force}" != 'true' ] ; then
+    terminate "Docker ${target_docker_version} can't use the 'aufs' storage driver set in dockerd.json, so it would not start after the update. ${advice}"
+  fi
+  echo "WARNING: Docker ${target_docker_version} can't use the 'aufs' storage driver; continuing because of --force. ${advice}"
 }
 
 #======================================================================================================================
@@ -786,6 +898,138 @@ execute_prepare() {
 }
 
 #======================================================================================================================
+# Reports the state of the Docker package as one of 'started', 'stopped', 'stopping', 'starting' or 'unknown'.
+# 'synopkg status' (DSM 7) and 'synoservicectl --status' (DSM 6) print free text, so keywords are matched with the
+# transitional states first ('stopping' must not be read as 'stopped').
+#======================================================================================================================
+# Outputs:
+#   Writes the normalized state to stdout.
+#======================================================================================================================
+get_syno_status() {
+  local raw
+  raw=$(get_syno_status_raw)
+  case "${raw}" in
+    *stopping*) echo 'stopping' ;;
+    *starting*) echo 'starting' ;;
+    *started*|*running*) echo 'started' ;;
+    *stopped*|*stop*) echo 'stopped' ;;
+    *) echo 'unknown' ;;
+  esac
+}
+
+#======================================================================================================================
+# Prints the raw package status as reported by Synology's package tool, for diagnostics.
+#======================================================================================================================
+get_syno_status_raw() {
+  case "${dsm_major_version}" in
+    "6") "$(resolve_syno_bin "synoservicectl" "${SYNOSERVICECTL_BIN}")" --status "${SYNO_DOCKER_SERV_NAME}" 2>&1 ;;
+    *)   "$(resolve_syno_bin "synopkg" "${SYNOPKG_BIN}")" status "${SYNO_DOCKER_SERV_NAME}" 2>&1 ;;
+  esac
+}
+
+#======================================================================================================================
+# Runs a start or stop of the Docker package with the matching timeout.
+#======================================================================================================================
+# Arguments:
+#   $1 - 'start' or 'stop'
+# Outputs:
+#   Returns the exit code of the package tool, or 124 if the timeout was reached.
+#======================================================================================================================
+syno_ctl() {
+  local action="$1" limit="${SYNO_SERVICE_STOP_TIMEOUT}"
+  [ "${action}" = 'start' ] && limit="${SYNO_SERVICE_START_TIMEOUT}"
+  case "${dsm_major_version}" in
+    "6") timeout --foreground "${limit}" "$(resolve_syno_bin "synoservicectl" "${SYNOSERVICECTL_BIN}")" \
+           "--${action}" "${SYNO_DOCKER_SERV_NAME}" ;;
+    *)   timeout --foreground "${limit}" "$(resolve_syno_bin "synopkg" "${SYNOPKG_BIN}")" \
+           "${action}" "${SYNO_DOCKER_SERV_NAME}" ;;
+  esac
+}
+
+#======================================================================================================================
+# Print the commands a user can run to start the Docker package or check its status, for messages.
+#======================================================================================================================
+syno_start_cmd() {
+  if [ "${dsm_major_version}" = "6" ] ; then
+    echo "sudo synoservicectl --start ${SYNO_DOCKER_SERV_NAME}"
+  else
+    echo "sudo synopkg start ${SYNO_DOCKER_SERV_NAME}"
+  fi
+}
+
+syno_status_cmd() {
+  if [ "${dsm_major_version}" = "6" ] ; then
+    echo "sudo synoservicectl --status ${SYNO_DOCKER_SERV_NAME}"
+  else
+    echo "sudo synopkg status ${SYNO_DOCKER_SERV_NAME}"
+  fi
+}
+
+#======================================================================================================================
+# Prints the number of running containers, or 'an unknown number of' if the Docker CLI can't be reached.
+#======================================================================================================================
+count_running_containers() {
+  local ids
+  if ids=$(docker ps -q 2>/dev/null) ; then
+    echo "${ids}" | awk 'NF' | wc -l | tr -d ' '
+  else
+    echo 'an unknown number of'
+  fi
+}
+
+#======================================================================================================================
+# Returns success if a dockerd process is running.
+#======================================================================================================================
+dockerd_running() {
+  pidof dockerd >/dev/null 2>&1 || pgrep -x dockerd >/dev/null 2>&1
+}
+
+#======================================================================================================================
+# Waits until the Docker package reports 'stopped' and no dockerd process remains. Synology's own stop can give up
+# before our timeout and leave the package 'stopping' while a container is still shutting down, so keep waiting until
+# the overall stop timeout has passed.
+#======================================================================================================================
+# Arguments:
+#   $1 - Timeout, in 'timeout' notation (e.g. '10m', '30s')
+#   $2 - Epoch seconds the stop began (defaults to now)
+# Outputs:
+#   Returns 0 once stopped, 1 if the timeout is reached first.
+#======================================================================================================================
+wait_for_syno_stopped() {
+  local limit="$1" since="${2:-$(date +%s)}" seconds deadline
+  case "${limit}" in
+    *m) seconds=$(( ${limit%m} * 60 )) ;;
+    *s) seconds="${limit%s}" ;;
+    *)  seconds="${limit}" ;;
+  esac
+  deadline=$(( since + seconds ))
+  while true ; do
+    if [ "$(get_syno_status)" = 'stopped' ] && ! dockerd_running ; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "${deadline}" ] ; then
+      return 1
+    fi
+    sleep "${SYNO_STATUS_POLL_INTERVAL}"
+  done
+}
+
+#======================================================================================================================
+# Prints the package status and where to look next, used when a stop or start does not complete.
+#======================================================================================================================
+print_syno_diagnostics() {
+  echo "   Package status: $(get_syno_status_raw | tr '\n' ' ')"
+  if dockerd_running ; then
+    echo "   dockerd process: still running"
+  else
+    echo "   dockerd process: not running"
+  fi
+  if [ "${dsm_major_version}" != "6" ] ; then
+    echo "   Docker daemon log: /var/log/systemd/pkg-${SYNO_DOCKER_SERV_NAME}-dockerd.service.log"
+  fi
+}
+
+#======================================================================================================================
 # Stops a running Docker daemon by invoking 'synoservicectl' or 'synopkg', unless 'stage' is set to true.
 #======================================================================================================================
 # Globals:
@@ -796,35 +1040,41 @@ execute_prepare() {
 execute_stop_syno() {
   print_status "Stopping Docker service"
 
-  if [ "${stage}" = 'false' ] ; then
-    case "${dsm_major_version}" in
-      "6")
-        synoservicectl_bin=$(resolve_syno_bin "synoservicectl" "${SYNOSERVICECTL_BIN}")
-        syno_status=$("${synoservicectl_bin}" --status "${SYNO_DOCKER_SERV_NAME}" | grep running -o)
-        if [ "${syno_status}" = 'running' ] ; then
-          timeout --foreground "${SYNO_SERVICE_STOP_TIMEOUT}" "${synoservicectl_bin}" --stop "${SYNO_DOCKER_SERV_NAME}"
-          syno_status=$("${synoservicectl_bin}" --status "${SYNO_DOCKER_SERV_NAME}" | grep stop -o)
-          if [ "${syno_status}" != 'stop' ] ; then
-            terminate "Could not stop Docker daemon"
-          fi
-        fi
-        ;;
-      "7")
-        synopkg_bin=$(resolve_syno_bin "synopkg" "${SYNOPKG_BIN}")
-        syno_status=$("${synopkg_bin}" status "${SYNO_DOCKER_SERV_NAME}" | grep started -o)
-        if [ "${syno_status}" = 'started' ] ; then
-          timeout --foreground "${SYNO_SERVICE_STOP_TIMEOUT}" "${synopkg_bin}" stop "${SYNO_DOCKER_SERV_NAME}"
-          syno_status=$("${synopkg_bin}" status "${SYNO_DOCKER_SERV_NAME}" | grep stopped -o)
-          if [ "${syno_status}" != 'stopped' ] ; then
-            terminate "Could not stop Docker daemon"
-          fi
-        fi
-        ;;
-      *)
-        echo "ERROR: Cannot stop Docker package, unsupported DSM version: ${dsm_major_version}"
-    esac
-  else
+  if [ "${stage}" = 'true' ] ; then
     echo "Skipping Docker service control in STAGE mode"
+    return
+  fi
+
+  stop_started_at=$(date +%s)
+  syno_status=$(get_syno_status)
+  case "${syno_status}" in
+    started)
+      echo "   - stopping ${SYNO_DOCKER_SERV_NAME} ($(count_running_containers) running containers," \
+        "timeout ${SYNO_SERVICE_STOP_TIMEOUT})"
+      syno_ctl stop
+      ;;
+    stopped)
+      echo "   - ${SYNO_DOCKER_SERV_NAME} is already stopped, continuing"
+      ;;
+    *)
+      echo "   - ${SYNO_DOCKER_SERV_NAME} is '${syno_status}', waiting for it to finish stopping" \
+        "(timeout ${SYNO_SERVICE_STOP_TIMEOUT})"
+      ;;
+  esac
+
+  # Never replace binaries while the package is mid-transition or dockerd is still running
+  if ! wait_for_syno_stopped "${SYNO_SERVICE_STOP_TIMEOUT}" "${stop_started_at}" ; then
+    print_syno_diagnostics
+    echo "   ${SYNO_DOCKER_SERV_NAME} did not finish stopping within ${SYNO_SERVICE_STOP_TIMEOUT}" \
+      "($(count_running_containers) containers still running). The Docker binaries have not been replaced."
+    echo "   A container that ignores SIGTERM can hold up the stop. Check 'sudo docker ps', wait for the stop to"
+    echo "   complete (or stop the stuck container), confirm '$(syno_status_cmd)' shows it's"
+    echo "   stopped, then re-run this script. With many containers, stopping them first makes this much faster."
+    syno_status=$(get_syno_status)
+    if [ "${syno_status}" = 'stopped' ] && dockerd_running ; then
+      terminate "${SYNO_DOCKER_SERV_NAME} reports stopped, but dockerd is still running"
+    fi
+    terminate "Timed out stopping Docker (status: ${syno_status})"
   fi
 }
 
@@ -902,14 +1152,19 @@ execute_extract_bin() {
       terminate "Files could not be extracted from archive"
     fi
 
-    # override runc binary on Kernels 5+ is present
-    if uname -r | grep -q '^5\.'; then
-      print_status "Detected Kernel v5, downloading / pinning runc version."
+    # runc 1.3.3-1.3.x and 1.4.0 fail on DSM 5.x kernels ("unsafe procfs detected ... proc/self/setgroups: no such
+    # file or directory"). Fixed upstream in runc 1.4.1 / 1.5.0, so only override the bundled runc when it's affected.
+    bundled_runc=$("${temp_dir}/docker/runc" --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if uname -r | grep -q '^5\.' && echo "${bundled_runc}" | grep -Eq '^1\.(3\.([3-9]|[1-9][0-9])|4\.0)$'; then
+      echo "Bundled runc ${bundled_runc} is incompatible with Kernel v5, downloading / pinning runc ${PINNED_RUNC_VERSION}."
       response=$(curl -L "${PINNED_RUNC}" --write-out '%{http_code}' -o "${temp_dir}/docker/runc")
       if [ "${response}" != 200 ] ; then
         terminate "runc binary could not be downloaded"
       fi
       chmod +x "${temp_dir}/docker/runc"
+      echo "Target runc version: ${PINNED_RUNC_VERSION} (pinned, replaces bundled ${bundled_runc:-Unknown})"
+    else
+      echo "Target runc version: ${bundled_runc:-Unknown} (bundled)"
     fi
   fi
 }
@@ -1134,6 +1389,8 @@ execute_update_script() {
     # File to edit
     file="${SYNO_DOCKER_SCRIPT}"
 
+    remove_legacy_module_lines "${file}"
+
     # Fallback MASQUERADE rule in the DSM-managed DEFAULT_POSTROUTING chain. dockerd adds its own MASQUERADE rules to
     # nat POSTROUTING, but DSM's firewall reloads flush them, leaving containers without outbound NAT. The rule is only
     # added when the chain exists (it is absent when the DSM firewall is disabled) and only once (checked with -C).
@@ -1219,39 +1476,44 @@ execute_start_syno() {
   print_status "Starting Docker service - May take a while. "
   echo "   - timeout set to ${SYNO_SERVICE_START_TIMEOUT} based on ${RUNNING_CONTAINERS} active containers"
 
-  if [ "${stage}" = 'false' ] ; then
-    case "${dsm_major_version}" in
-      "6")
-        synoservicectl_bin=$(resolve_syno_bin "synoservicectl" "${SYNOSERVICECTL_BIN}")
-        timeout --foreground "${SYNO_SERVICE_START_TIMEOUT}" "${synoservicectl_bin}" --start "${SYNO_DOCKER_SERV_NAME}"
-
-        syno_status=$("${synoservicectl_bin}" --status "${SYNO_DOCKER_SERV_NAME}" | grep running -o)
-        if [ "${syno_status}" != 'running' ] ; then
-          if [ "${force}" != 'true' ] ; then
-            terminate "Could not bring Docker Engine back online"
-          else
-            echo "ERROR: Could not bring Docker Engine back online"
-          fi
-        fi
-        ;;
-      "7")
-        synopkg_bin=$(resolve_syno_bin "synopkg" "${SYNOPKG_BIN}")
-        timeout --foreground "${SYNO_SERVICE_START_TIMEOUT}" "${synopkg_bin}" start "${SYNO_DOCKER_SERV_NAME}"
-
-        syno_status=$("${synopkg_bin}" status "${SYNO_DOCKER_SERV_NAME}" | grep started -o)
-        if [ "${syno_status}" != 'started' ] ; then
-          if [ "${force}" != 'true' ] ; then
-            terminate "Could not bring Docker Engine back online"
-          else
-            echo "ERROR: Could not bring Docker Engine back online"
-          fi
-        fi
-        ;;
-      *)
-        echo "ERROR: Cannot start Docker package, unsupported DSM version: ${dsm_major_version}"
-    esac
-  else
+  if [ "${stage}" = 'true' ] ; then
     echo "Skipping Docker service control in STAGE mode"
+    return
+  fi
+
+  syno_status=$(get_syno_status)
+  if [ "${syno_status}" = 'stopping' ] ; then
+    print_syno_diagnostics
+    fail_start "${SYNO_DOCKER_SERV_NAME} is still stopping, so it cannot be started yet. This is a problem with the" \
+      "stop, not the start: wait for it to finish (or stop the stuck container), then run" \
+      "'$(syno_start_cmd)'"
+    return
+  fi
+
+  syno_ctl start
+  rc=$?
+  syno_status=$(get_syno_status)
+  if [ "${syno_status}" != 'started' ] ; then
+    print_syno_diagnostics
+    if [ "${rc}" -eq 124 ] ; then
+      fail_start "Timed out after ${SYNO_SERVICE_START_TIMEOUT} starting Docker (status: ${syno_status})"
+    else
+      fail_start "Docker failed to start (status: ${syno_status})"
+    fi
+  fi
+}
+
+#======================================================================================================================
+# Reports a failed start: terminates, or only prints the error when the operation is forced.
+#======================================================================================================================
+# Arguments:
+#   $@ - Error message
+#======================================================================================================================
+fail_start() {
+  if [ "${force}" != 'true' ] ; then
+    terminate "$*"
+  else
+    echo "ERROR: $*"
   fi
 }
 
@@ -1264,10 +1526,10 @@ execute_start_syno() {
 #   modules installed, start script modified (if necessary)
 #======================================================================================================================
 install_modules() {
-  print_status "Checking for / Installing iptables modules."
   if [[ "${install_iptables_modules}" == 'true' ]]; then
-  echo "   Based on this version of docker, we'll need to check for / install iptables modules..."
-  "${SCRIPT_DIR}/install_iptables_modules.sh" || terminate "Could not install iptables modules. Stopping."
+    print_status "Checking for / Installing iptables modules."
+    echo "   Based on this version of docker, we'll need to check for / install iptables modules..."
+    "${SCRIPT_DIR}/install_iptables_modules.sh" || terminate "Could not install iptables modules. Stopping."
   fi
 }
 
@@ -1283,6 +1545,78 @@ install_apparmor_profile() {
   if [[ "${install_apparmor}" == 'true' ]]; then
     print_status "Installing AppArmor parser wrapper and docker-default profile."
     bash "${SCRIPT_DIR}/install_apparmor_profile.sh" || terminate "Could not install AppArmor profile. Stopping."
+  fi
+}
+
+#======================================================================================================================
+# Removes the insmod lines that older versions of install_iptables_modules.sh inserted into start-stop-status, once
+# the systemd drop-in loads the modules instead. Runs on every start-stop-status update (including forced and
+# same-version updates, and after a legacy version of the script added them again), and only when the drop-in exists.
+#======================================================================================================================
+# Arguments:
+#   $1 - start-stop-status file
+#======================================================================================================================
+remove_legacy_module_lines() {
+  local file="$1" unit
+  unit=$(sed -n 's/^Dockerd="\(.*\)"[[:space:]]*$/\1/p' "${file}" | head -1)
+  if [ -z "${unit}" ] || [ ! -f "/etc/systemd/system/${unit}.service.d/iptables-raw-modules.conf" ] || \
+    ! grep -q 'Load raw modules' "${file}"; then
+    return
+  fi
+  sed -i '/^[[:space:]]*# Added by docker update[[:space:]]*$/{N;/\n[[:space:]]*# Load raw modules[[:space:]]*$/d}' "${file}"
+  sed -i '/^[[:space:]]*# Load raw modules[[:space:]]*$/d' "${file}"
+  sed -i '/^[[:space:]]*insmod \/lib\/modules\/ip6\{0,1\}table_raw\.ko[[:space:]]*$/d' "${file}"
+  echo "Removed the old module loading lines from ${file} (the systemd drop-in loads the modules now)."
+}
+
+#======================================================================================================================
+# Re-checks how the iptables raw modules are loaded on hosts that already have them installed (Docker 28+), outside a
+# full update: on DSM 7 this moves module loading from start-stop-status to a systemd drop-in, and restores it if a
+# Container Manager package update removed it. Skipped with --skip-iptables or when the modules were never installed.
+#======================================================================================================================
+# Globals:
+#   - skip_iptables_modules
+#   - stage
+#======================================================================================================================
+migrate_module_loading() {
+  if [ "${skip_iptables_modules}" = 'true' ] || [ "${stage}" = 'true' ] || \
+    { [ ! -f /lib/modules/iptable_raw.ko ] && [ ! -f /lib/modules/ip6table_raw.ko ] ; } ; then
+    return
+  fi
+  echo "Checking how the iptables raw modules are loaded..."
+  "${SCRIPT_DIR}/install_iptables_modules.sh" || echo "WARNING: could not update how the iptables modules are loaded"
+}
+
+#======================================================================================================================
+# Sets up fuse-overlayfs storage when asked for with --fuse-overlayfs (see install_fuse_overlayfs.sh). Runs before
+# Docker is stopped, so a declined or failed setup leaves Docker untouched.
+#======================================================================================================================
+# Globals:
+#   - force
+#   - install_fuse
+#   - stage
+#======================================================================================================================
+setup_fuse_overlayfs() {
+  if [ "${install_fuse}" != 'true' ] ; then
+    return
+  fi
+  print_status "Setting up fuse-overlayfs storage"
+  if [ "${stage}" = 'true' ] ; then
+    echo "Skipping fuse-overlayfs setup in STAGE mode"
+    return
+  fi
+  fuse_args=''
+  [ "${force}" = 'true' ] && fuse_args='--yes'
+  # shellcheck disable=SC2086
+  "${SCRIPT_DIR}/install_fuse_overlayfs.sh" ${fuse_args} || \
+    terminate "fuse-overlayfs was not set up, so the update was stopped. Docker has not been changed."
+
+  # dockerd will depend on the snapshotter and the separate containerd (normally started at boot by the rc.d script).
+  # They use their own sockets, so they can start now alongside the running Docker, which reads its new configuration
+  # when it's restarted later in the update.
+  if [ -x "${FUSE_OVERLAYFS_RC_SCRIPT}" ] ; then
+    echo "   - starting fuse-overlayfs services"
+    "${FUSE_OVERLAYFS_RC_SCRIPT}" start
   fi
 }
 
@@ -1361,6 +1695,9 @@ main() {
         masq_subnet="$1"
         validate_subnet_input "${masq_subnet}" "Unrecognized subnet for --masq-subnet (expected IPv4 CIDR, e.g. 172.16.0.0/12)"
         ;;
+      --fuse-overlayfs )
+        install_fuse='true'
+        ;;
       -h | --help )
         usage
         exit
@@ -1379,7 +1716,7 @@ main() {
         target="$1"
         validate_target "Invalid target"
         ;;
-      backup | restore | update | logger | validate | only_script )
+      backup | restore | update | logger | validate | only_script | start | stop )
         command="$1"
         ;;
       download | install )
@@ -1400,9 +1737,10 @@ main() {
     only_script )
       total_steps=1
       execute_update_script
+      migrate_module_loading
       ;;
     backup )
-      total_steps=3
+      total_steps=1
       detect_current_versions
       execute_prepare
       execute_backup
@@ -1417,19 +1755,22 @@ main() {
       execute_download_buildx
       ;;
     install )
-      total_steps=8
+      total_steps=7
       detect_current_versions
       validate_syno_tools
       execute_prepare
       define_target_download
+      define_setup_steps
       confirm_operation
       execute_backup
       install_modules
+      setup_fuse_overlayfs
       execute_stop_syno
       execute_extract_bin
       execute_install_bin
       execute_update_log
       execute_update_script
+      install_apparmor_profile
       execute_start_syno
       ;;
     restore )
@@ -1446,6 +1787,18 @@ main() {
       execute_restore_script
       execute_start_syno
       ;;
+    start )
+      total_steps=1
+      detect_current_versions
+      validate_syno_tools
+      execute_start_syno
+      ;;
+    stop )
+      total_steps=1
+      detect_current_versions
+      validate_syno_tools
+      execute_stop_syno
+      ;;
     logger )
       total_steps=4
       detect_current_versions
@@ -1457,7 +1810,7 @@ main() {
       execute_start_syno
       ;;
     update )
-      total_steps=13
+      total_steps=11
       detect_current_versions
       validate_syno_tools
       execute_prepare
@@ -1466,6 +1819,7 @@ main() {
       confirm_operation
       execute_backup
       install_modules
+      setup_fuse_overlayfs
       execute_download_bin
       execute_download_compose
       execute_download_buildx
