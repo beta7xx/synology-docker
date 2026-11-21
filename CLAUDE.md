@@ -11,7 +11,12 @@ Bash scripts that update Docker Engine, Compose and Buildx on Synology NAS devic
 ## Fork layout
 
 - `upstream` = `telnetdoogie-labs/synology-docker`; `origin` = the user's fork.
-- `main` mirrors `upstream/main`. `local` is `main` plus the fork-only features, kept as commits on top.
+- `main` mirrors `upstream/main`. `local` is `main` plus the fork-only features, kept as commits on top. `local` is the fork's default branch on GitHub.
+- Local `main` tracks `upstream/main`, not `origin/main`: `git pull` on `main` pulls from upstream, and the fork only catches up when `main` is pushed to `origin` explicitly.
+- Syncing with upstream:
+  1. `git fetch upstream`, fast-forward `main`, then `git push origin main` and push any new release tags (`git push origin <tag>`).
+  2. Bring `local` up to date on top of the new `main`, then run the test suite and ShellCheck before pushing. Upstream changes to the updater usually need the fork's Buildx/plugin and MASQUERADE code adapted, not just merged.
+  3. If either push is rejected as non-fast-forward, upstream rewrote history (see below). Use `--force-with-lease=<branch>:<old-tip>` and only after the user confirms.
 - Fork-only features (not in upstream, keep them when syncing):
   - Buildx and the `docker compose` plugin installed to `/usr/local/lib/docker/cli-plugins` (`--buildx`, `--target buildx`), included in backup/restore.
   - A fallback NAT `MASQUERADE` rule in DSM's `DEFAULT_POSTROUTING` chain (`--masq-subnet`, also in `fix_ipforward.sh`).
