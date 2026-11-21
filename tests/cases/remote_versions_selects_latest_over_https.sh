@@ -10,11 +10,13 @@ curl() {
   case "$2" in
     "${DOWNLOAD_DOCKER}/") printf '>docker-9.9.9.tgz\n>docker-29.9.9.tgz\n>docker-100.0.0.tgz\n' ;;
     "$GITHUB_API_COMPOSE") printf '{"tag_name":"v2.42.0"}\n' ;;
+    "$GITHUB_API_BUILDX") printf '{"tag_name":"v0.37.1"}\n' ;;
     *) return 22 ;;
   esac
 }
 target_docker_version=''
 target_compose_version=''
+target_buildx_version=''
 
 # Act: look up the newest engine and Compose release.
 detect_available_versions
@@ -22,6 +24,7 @@ detect_available_versions
 # Expect: numeric engine ordering and HTTPS-only downloads.
 expect_eq 100.0.0 "$target_docker_version" 'numeric sort selects latest engine'
 expect_eq 2.42.0 "$target_compose_version" 'Compose release tag is parsed'
+expect_eq 0.37.1 "$target_buildx_version" 'Buildx release tag is parsed'
 curl_args=$(<"$curl_args_file")
 expect_contains "$curl_args" '--proto =https' 'version lookup requires HTTPS'
 expect_contains "$curl_args" '--proto-redir =https' 'version lookup redirects require HTTPS'

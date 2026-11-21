@@ -18,6 +18,9 @@ init_update_fixture() {
   # shellcheck source=syno_docker_update.sh
   source "$repo_dir/syno_docker_update.sh"
   cp "$repo_dir/test_file/dockerd.json" "$SYNO_DOCKER_JSON"
+  # Pin Buildx (as --buildx would) so cases that aren't about it need no release lookup; reset the plugin folder.
+  target_buildx_version=0.37.1
+  rm -rf "$DOCKER_CLI_PLUGINS_DIR"
 }
 
 prepare_installed_files() {

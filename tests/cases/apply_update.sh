@@ -66,6 +66,7 @@ update_output=$(
     case "$url" in
       "$DOWNLOAD_DOCKER/docker-29.0.0.tgz") cp "$test_tmp_dir/engine.tgz" "$destination" ;;
       */docker-compose-linux-x86_64) cp "$test_tmp_dir/compose-binary" "$destination" ;;
+      */buildx-v0.37.1.linux-amd64) printf 'buildx-binary\n' > "$destination" ;;
       *) return 22 ;;
     esac
     printf 200
@@ -99,6 +100,10 @@ update_output=$(
 expect_contains "$update_output" 'Done.' 'update reports completion'
 expect_file_contains "$SYNO_DOCKER_BIN/docker" staged-only 'new engine binary is installed'
 expect_eq compose-binary "$(<"$SYNO_DOCKER_BIN/docker-compose")" 'new Compose binary is installed'
+expect_eq compose-binary "$(<"$DOCKER_CLI_PLUGINS_DIR/docker-compose")" "Compose is also installed as 'docker compose' plugin"
+expect_eq buildx-binary "$(<"$DOCKER_CLI_PLUGINS_DIR/docker-buildx")" 'Buildx plugin is installed'
+expect_eq 755 "$(stat -c %a "$DOCKER_CLI_PLUGINS_DIR/docker-buildx")" 'plugins are executable by regular users'
+expect_file_contains "$SYNO_DOCKER_SCRIPT" 'DEFAULT_POSTROUTING -s 172.16.0.0/12 ! -d 172.16.0.0/12 -j MASQUERADE' 'startup script includes the MASQUERADE fallback'
 expect_eq local "$(jq -r '.["log-driver"]' "$SYNO_DOCKER_JSON")" 'daemon uses local logging'
 expect_eq 5 "$(jq -r '.["log-opts"]["max-file"]' "$SYNO_DOCKER_JSON")" 'daemon retains five log files'
 expect_file_contains "$SYNO_DOCKER_SCRIPT" 'iptables -C FORWARD -j DOCKER-FORWARD' 'startup script includes forwarding rule'

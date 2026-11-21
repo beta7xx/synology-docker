@@ -41,6 +41,7 @@ stage_output=$(
     case "$url" in
       "$DOWNLOAD_DOCKER/docker-29.0.0.tgz") cp "$test_tmp_dir/engine.tgz" "$destination" ;;
       */docker-compose-linux-x86_64) cp "$test_tmp_dir/compose-binary" "$destination" ;;
+      */buildx-v0.37.1.linux-amd64) printf 'buildx-binary\n' > "$destination" ;;
       *) return 22 ;;
     esac
     printf 200
@@ -56,6 +57,8 @@ stage_dir=$(printf '%s\n' "$stage_output" | sed -n 's/^Staged files: //p' | tail
 expect_success 'staging path is reported' test -n "$stage_dir"
 expect_file_exists "$stage_dir/docker-29.0.0.tgz" 'engine download is retained'
 expect_file_exists "$stage_dir/docker-compose" 'Compose download is retained'
+expect_file_exists "$stage_dir/docker-buildx" 'Buildx download is retained'
+expect_file_absent "$DOCKER_CLI_PLUGINS_DIR" 'stage must not install CLI plugins'
 expect_file_exists "$stage_dir/docker/docker" 'extracted engine is retained'
 expect_file_exists "$test_tmp_dir/staged.tgz" 'backup is retained'
 expect_eq "$installed_docker_hash" "$(sha256sum "$SYNO_DOCKER_BIN/docker" | cut -d' ' -f1)" 'stage must not replace installed Docker'

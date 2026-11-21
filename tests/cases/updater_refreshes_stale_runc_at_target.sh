@@ -18,6 +18,9 @@ plan_current_update() {
   runc_version=$2
   compose_version='2.42.0'
   target_compose_version='2.42.0'
+  compose_plugin_version='2.42.0'
+  buildx_version=$target_buildx_version
+  skip_buildx_update='false'
   skip_docker_update='false'
   skip_compose_update='false'
   skip_driver_update='false'

@@ -16,6 +16,9 @@ prepare_update_run_fixture() {
     case "$1" in
       ps) return 0 ;;
       -v) [[ -n "$mock_docker_version" ]] && printf 'Docker version %s, build test\n' "$mock_docker_version" ;;
+      # The 'docker compose' plugin matches the standalone binary and Buildx is at its pinned target.
+      compose) [[ -n "$mock_compose_version" ]] && printf 'Docker Compose version v%s\n' "$mock_compose_version" ;;
+      buildx) printf 'github.com/docker/buildx v%s test\n' "$target_buildx_version" ;;
       *) return 1 ;;
     esac
   }
