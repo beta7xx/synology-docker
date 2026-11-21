@@ -1,9 +1,12 @@
 # synology-docker
 
 > [!NOTE]
-> An unofficial but battle‑tested way to update Docker Engine & Docker Compose on Synology NAS.
+> An unofficial but battle‑tested way to update Docker Engine, Docker Compose & Docker Buildx on Synology NAS.
 >
-> Originally forked from [markdumay/synology-docker](https://github.com/markdumay/synology-docker)
+> This is a fork of [telnetdoogie-labs/synology-docker](https://github.com/telnetdoogie-labs/synology-docker) (itself originally forked from [markdumay/synology-docker](https://github.com/markdumay/synology-docker)). On top of upstream it adds:
+>
+> - the `docker compose` and `docker buildx` CLI plugins ([details](#what-you-end-up-with-vs-dockers-ubuntu-packages))
+> - a fallback NAT `MASQUERADE` rule that survives DSM firewall reloads ([details](#networking-fixes-applied-to-start-stop-status))
 
 [![CI](https://github.com/telnetdoogie-labs/synology-docker/actions/workflows/ci.yml/badge.svg)](https://github.com/telnetdoogie-labs/synology-docker/actions/workflows/ci.yml) ![Last Commit][synology-docker-last-commit] ![Issues][synology-docker-issues] ![Pull Requests][synology-docker-pulls] ![License][synology-docker-license]
 
@@ -14,7 +17,8 @@ Synology ships Docker or, as they call it in later versions, "Container Manager"
 This repo gives you a **repeatable, reversible, and reasonably safe** way to:
 
 - Update Docker Engine on Synology to the latest
-- Update Docker Compose
+- Update Docker Compose (standalone `docker-compose` and the `docker compose` plugin)
+- Install and update Docker Buildx (`docker buildx`)
 - Escape Synology’s legacy `db` log driver
 - Roll back if something goes sideways
 
@@ -81,13 +85,17 @@ Engine binaries go to the ContainerManager/Docker package `bin` folder. CLI plug
 `/usr/local/lib/docker/cli-plugins`, the well-known path the Docker CLI searches, so `docker compose` and
 `docker buildx` work for all users. Plugins are included in backups and restored by `restore`.
 
+Nothing is pinned: each run looks up the latest stable Engine, Compose and Buildx releases. If a lookup fails, the
+update stops before changing anything; pass the version yourself (`--docker`, `--compose`, `--buildx`) to skip the
+lookup. A component already at its target version is skipped unless you use `--force`.
+
 ### Networking fixes applied to `start-stop-status`
 
 Every `update` (and `only_script`) inserts a small block into the package's `start-stop-status` that runs after
 dockerd is up:
 
-- **FORWARD chain**: sets the policy to `ACCEPT` and jumps to `DOCKER-FORWARD`, so published ports stay reachable
-  after a clean boot.
+- **FORWARD chain**: sets the policy to `ACCEPT`, jumps to `DOCKER-FORWARD`, and starts the guard described in
+  step 6 above, so published ports stay reachable after a clean boot and after DSM firewall rewrites.
 - **NAT MASQUERADE fallback**: DSM firewall reloads flush the MASQUERADE rules dockerd adds to `nat POSTROUTING`,
   leaving containers without outbound internet. The script adds a persistent catch-all rule to the DSM-managed
   `DEFAULT_POSTROUTING` chain (skipped when that chain does not exist, e.g. DSM firewall disabled):
@@ -104,7 +112,7 @@ dockerd is up:
 SSH into your NAS and clone the repo:
 
 ```bash
-git clone https://github.com/telnetdoogie-labs/synology-docker
+git clone https://github.com/beta7xx/synology-docker
 cd synology-docker
 ```
 
@@ -162,7 +170,7 @@ Re‑run `syno_docker_list_containers.sh` until **everything** says `local`. The
 
 > Containers created via `docker run` will show a _best‑guess_ recreate command, including environment values inline. Review it before running — for anything sensitive or non‑trivial, prefer the migration tool above.
 
-### Step 3: Upgrade Docker & Compose
+### Step 3: Upgrade Docker, Compose & Buildx
 
 ```bash
 sudo ./syno_docker_update.sh update
@@ -202,26 +210,28 @@ sudo ./syno_docker_update.sh [OPTIONS] COMMAND
 
 ### Commands
 
-| Command         | Description                                                  |
-| --------------- | ------------------------------------------------------------ |
-| `backup`        | Backup Docker binaries & config                              |
-| `download PATH` | Download Docker & Compose binaries                           |
-| `install PATH`  | Install from downloaded files                                |
-| `restore`       | Restore from backup (works with Container Manager stopped)   |
-| `logger`        | Update logging driver only                                   |
-| `update`        | Full backup + update                                         |
-| `start`         | Start Container Manager, reporting why if it doesn't come up |
-| `stop`          | Stop Container Manager, waiting for it to finish             |
+| Command         | Description                                                                         |
+| --------------- | ----------------------------------------------------------------------------------- |
+| `backup`        | Backup Docker binaries, CLI plugins & config                                        |
+| `download PATH` | Download Docker, Compose & Buildx binaries                                          |
+| `install PATH`  | Install from downloaded files (`docker-VERSION.tgz`, `docker-compose`, `docker-buildx`) |
+| `restore`       | Restore from backup (works with Container Manager stopped)                          |
+| `logger`        | Update logging driver only                                                          |
+| `update`        | Full backup + update                                                                |
+| `only_script`   | Re-apply the `start-stop-status` networking block and module loading only           |
+| `validate`      | Show current and target versions without changing anything                          |
+| `start`         | Start Container Manager, reporting why if it doesn't come up                        |
+| `stop`          | Stop Container Manager, waiting for it to finish                                    |
 
 ## Options
 
 | Option              | Description                                                                         |
 | ------------------- | ----------------------------------------------------------------------------------- |
-| `--docker VERSION`  | Target Docker version                                                               |
-| `--compose VERSION` | Target Compose version                                                              |
-| `--buildx VERSION`  | Target Buildx version                                                               |
+| `--docker VERSION`  | Target Docker version (default: latest)                                             |
+| `--compose VERSION` | Target Compose version (default: latest)                                            |
+| `--buildx VERSION`  | Target Buildx version (default: latest)                                             |
 | `--masq-subnet CIDR` | Source subnet for the fallback NAT MASQUERADE rule (default `172.16.0.0/12`)       |
-| `--target NAME`     | `all`, `engine`, `compose`, `buildx`, or `driver`                                   |
+| `--target NAME`     | What to update: `all` (default), `engine`, `compose`, `buildx`, or `driver`         |
 | `--backup NAME`     | Backup file name                                                                    |
 | `--force`           | Skip confirmation and compatibility checks; allow an explicitly requested downgrade |
 | `--stage`           | Download and extract without installing; print the retained staging path            |
@@ -302,6 +312,7 @@ The supported test scope is DSM major versions 6 and 7 only. The mocked cases co
 ### Validation status
 
 - **DSM 7:** an earlier hardening revision was live-tested on DSM 7.4.1 with Docker Engine 29.8.2 and Docker Compose 5.6.0, including kernel-module/AppArmor preparation and `db`-logger recovery workflows. This upstream-aligned revision has not yet been retested on a NAS.
+- **This fork's additions** (CLI plugins, Buildx, the `MASQUERADE` fallback) are covered by the mocked tests only and have not been verified on a NAS since they were moved onto the current upstream.
 - **DSM 6:** the runtime probe, `logger`, update to Docker 27.5.1, workload, rollback, and `stop`/`start` pass on DSM 6.2.4-25556 Update 8 on a DS918+. **Docker Engine 27.x is the newest DSM 6 can use:** Engine 28+ needs kernel modules, and none are published for DSM 6 kernels, so a 28+ update stops before changing anything. Use `--docker 27.5.1` (or another 27.x release).
 
 Before running the updater on a NAS, check its runtime prerequisites with:
